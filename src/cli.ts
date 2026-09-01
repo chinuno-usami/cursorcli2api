@@ -55,14 +55,63 @@ function defaultEnvCandidates(): string[] {
   return [];
 }
 
+/**
+ * Dotenv must be loaded before commander declares its options, because option
+ * defaults such as `--port` are evaluated eagerly at declaration time.
+ */
+function preloadDotenvFromArgv(argv: string[]): void {
+  let envFile: string | undefined;
+  let autoEnv = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--env-file") {
+      envFile = argv[i + 1];
+    } else if (arg.startsWith("--env-file=")) {
+      envFile = arg.slice("--env-file=".length);
+    } else if (arg === "--auto-env") {
+      autoEnv = true;
+    }
+  }
+
+  if (envFile) {
+    maybeLoadDotenv(envFile);
+    if (existsSync(envFile)) {
+      console.error(`[agent-cli-to-api] loaded env: ${envFile}`);
+    }
+    return;
+  }
+
+  if (autoEnv) {
+    for (const candidate of defaultEnvCandidates()) {
+      maybeLoadDotenv(candidate);
+      console.error(`[agent-cli-to-api] loaded env: ${candidate}`);
+      break;
+    }
+    return;
+  }
+
+  process.env.CODEX_NO_DOTENV = process.env.CODEX_NO_DOTENV ?? "1";
+}
+
 async function main(): Promise<void> {
+  preloadDotenvFromArgv(process.argv.slice(2));
+
   program
     .name("agent-cli-to-api")
     .description("Expose agent CLIs as an OpenAI-compatible /v1 API gateway.")
     .argument("[provider]", "Provider to use: codex|gemini|claude|cursor-agent (or `doctor`).")
     .argument("[mode]", "Optional mode: curl (log request curl commands).")
-    .option("--host <host>", "Bind host", process.env.CODEX_HOST ?? "127.0.0.1")
-    .option("--port <port>", "Bind port", process.env.CODEX_PORT ?? "8000")
+    .option(
+      "--host <host>",
+      "Bind host",
+      process.env.CODEX_HOST ?? process.env.CODEX_GATEWAY_HOST ?? "127.0.0.1"
+    )
+    .option(
+      "--port <port>",
+      "Bind port",
+      process.env.CODEX_PORT ?? process.env.CODEX_GATEWAY_PORT ?? "8000"
+    )
     .option("--log-level <level>", "Log level", process.env.CODEX_LOG_LEVEL ?? "info")
     .option("--log-curl", "Log copy-pastable curl commands for incoming requests")
     .option("--env-file <path>", "Optionally load environment variables from this .env file")
@@ -83,21 +132,6 @@ async function main(): Promise<void> {
   const args = program.args;
   const providerArg = args[0];
   const modeArg = args[1];
-
-  if (opts.envFile) {
-    maybeLoadDotenv(opts.envFile);
-    if (existsSync(opts.envFile)) {
-      console.error(`[agent-cli-to-api] loaded env: ${opts.envFile}`);
-    }
-  } else if (opts.autoEnv) {
-    for (const candidate of defaultEnvCandidates()) {
-      maybeLoadDotenv(candidate);
-      console.error(`[agent-cli-to-api] loaded env: ${candidate}`);
-      break;
-    }
-  } else {
-    process.env.CODEX_NO_DOTENV = process.env.CODEX_NO_DOTENV ?? "1";
-  }
 
   const normalizedProvider = normalizeProvider(providerArg);
   const providerRaw = (providerArg ?? "").trim().toLowerCase().replace(/_/g, "-");

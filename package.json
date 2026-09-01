@@ -8,12 +8,12 @@
     "cursorcli2api": "dist/cli.js"
   },
   "scripts": {
-    "start": "node dist/cli.js cursor-agent --host 0.0.0.0",
-    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js cursor-agent --auto-env",
+    "dev": "tsx src/cli.ts --auto-env",
     "build": "tsc && cp -r src/codex_instructions dist/",
     "test": "node --import tsx --test tests/**/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "doctor": "tsx src/cli.ts doctor"
+    "doctor": "tsx src/cli.ts doctor --auto-env"
   },
   "engines": {
     "node": ">=20"
