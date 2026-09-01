@@ -447,6 +447,20 @@ export function buildToolCallSystemPrompt(tools: unknown[] | undefined): string 
     return `- ${f.name}: ${f.description || "(no description)"}\n  parameters: ${params}`;
   }).join("\n");
 
+  const askTool = defs.find((f) => /^ask[_-]?question$/i.test(f.name));
+  // Built-in interactive tools are silently skipped in headless mode, so the
+  // question never reaches the client. Route asking through the marker instead.
+  const askRules = askTool
+    ? [
+        `- NEVER use any built-in interactive tool (AskQuestion, ask_followup_question, or similar) to ask the user something. Those tools cannot reach the user here and are skipped silently.`,
+        `- To ask the user anything, you MUST emit the marker block above with "name": "${askTool.name}", then stop and wait for the tool result.`,
+        `- Do not guess an answer or pick a default on the user's behalf when a real decision is needed. Ask via ${askTool.name}.`,
+      ]
+    : [
+        `- NEVER use any built-in interactive tool (AskQuestion, ask_followup_question, or similar). Those tools cannot reach the user here and are skipped silently.`,
+        `- If you need a decision from the user and no tool above can ask for it, write the question and the options as plain text and stop.`,
+      ];
+
   return [
     `You have access to the following tools. When you need to call a tool, respond EXACTLY in this format (no other text around the markers):`,
     ``,
@@ -461,6 +475,7 @@ export function buildToolCallSystemPrompt(tools: unknown[] | undefined): string 
     `- If you decide to call a tool, output ONLY the marker block above, nothing else.`,
     `- You may call only ONE tool at a time.`,
     `- If you do NOT need a tool, respond normally without any markers.`,
+    ...askRules,
   ].join("\n");
 }
 
