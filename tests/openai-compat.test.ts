@@ -5,6 +5,10 @@ import {
   compatChatRequestToChatRequest,
   normalizeToolingRequest,
   responsesRequestToChatRequest,
+  parseToolCallResponse,
+  ToolCallMarkerStreamFilter,
+  toolCallContentRemainder,
+  TOOL_CALL_MARKER,
   type ChatCompletionRequest,
 } from "../src/lib/openai-compat.js";
 
@@ -113,4 +117,65 @@ test("compat and responses request conversion keep top-level tool fields availab
   const responsesExtra = (responsesRequest as Record<string, unknown>).model_extra as Record<string, unknown>;
   assert.deepEqual(responsesExtra.tools, [{ type: "function", function: { name: "lookup" } }]);
   assert.equal(responsesExtra.parallel_tool_calls, true);
+});
+
+test("ToolCallMarkerStreamFilter streams plain text and holds marker blocks", () => {
+  const f = new ToolCallMarkerStreamFilter();
+  const block =
+    `${TOOL_CALL_MARKER}\n` +
+    `{"name":"bash","arguments":{"command":"ls"}}\n` +
+    `${TOOL_CALL_MARKER}`;
+
+  assert.equal(f.feed("Hello "), "Hello ");
+  assert.equal(f.feed("world"), "world");
+  // Split marker across chunks
+  assert.equal(f.feed("___TOOL"), "");
+  assert.equal(f.feed("_CALL___"), "");
+  assert.equal(f.isHolding, true);
+  assert.equal(f.feed('\n{"name":"bash","arguments":{"command":"ls"}}\n'), "");
+  assert.equal(f.feed(TOOL_CALL_MARKER), "");
+  assert.equal(f.flush(), "");
+  assert.equal(f.streamedContent, "Hello world");
+
+  const full = "Hello world" + block;
+  const parsedFull = parseToolCallResponse(full);
+  assert.ok(parsedFull.toolCalls);
+  assert.equal(parsedFull.toolCalls![0].function.name, "bash");
+  assert.equal(parsedFull.text, "Hello world");
+  assert.equal(toolCallContentRemainder(f.streamedContent, parsedFull.text), "");
+});
+
+test("ToolCallMarkerStreamFilter emits post-marker clean text via remainder", () => {
+  const f = new ToolCallMarkerStreamFilter();
+  const full =
+    `${TOOL_CALL_MARKER}\n` +
+    `{"name":"read","arguments":{"path":"/tmp/a"}}\n` +
+    `${TOOL_CALL_MARKER}\n` +
+    `note after`;
+
+  for (const ch of full) {
+    assert.equal(f.feed(ch), "");
+  }
+  assert.equal(f.flush(), "");
+  assert.equal(f.streamedContent, "");
+  assert.equal(f.isHolding, true);
+
+  const parsed = parseToolCallResponse(full);
+  assert.ok(parsed.toolCalls);
+  assert.equal(parsed.toolCalls![0].function.name, "read");
+  assert.equal(toolCallContentRemainder(f.streamedContent, parsed.text), "note after");
+});
+
+test("ToolCallMarkerStreamFilter flush releases partial-marker lookahead for plain text", () => {
+  const f = new ToolCallMarkerStreamFilter();
+  // Ends with a proper prefix of the marker but never completes it
+  assert.equal(f.feed("ok ___TOOL_CAL"), "ok ");
+  assert.equal(f.flush(), "___TOOL_CAL");
+  assert.equal(f.streamedContent, "ok ___TOOL_CAL");
+});
+
+test("toolCallContentRemainder avoids re-emitting trimmed pre-marker text", () => {
+  assert.equal(toolCallContentRemainder("Hello\n", "Hello"), "");
+  assert.equal(toolCallContentRemainder("", "only clean"), "only clean");
+  assert.equal(toolCallContentRemainder("Hi", "Hi there"), " there");
 });

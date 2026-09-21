@@ -34,6 +34,8 @@ import {
   buildToolCallSystemPrompt,
   formatToolResultMessages,
   parseToolCallResponse,
+  ToolCallMarkerStreamFilter,
+  toolCallContentRemainder,
 } from "./lib/openai-compat.js";
 import { ResponsesRequestSchema } from "./lib/openai-compat.js";
 import { ChatCompletionRequestCompatSchema } from "./lib/openai-compat.js";
@@ -1212,6 +1214,10 @@ async function handleChatCompletions(
             let streamToolCalls: Record<string, unknown>[] | null = null;
             let assembledText = "";
             let sentContent = false;
+            const toolCallFilter =
+              provider === "cursor-agent" && requestTools && requestTools.length > 0
+                ? new ToolCallMarkerStreamFilter()
+                : null;
 
             const attemptModels: (string | null)[] =
               provider === "codex"
@@ -1377,17 +1383,23 @@ async function handleChatCompletions(
                 } else {
                   const timeoutMs = keepaliveSec > 0 ? keepaliveSec * 1000 : 0;
                   if (timeoutMs > 0) {
-                    const result = await Promise.race([
-                      waitForNext().then(() => queue.shift() ?? null),
-                      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
+                    // Only race for the wakeup. Draining the queue inside the racing
+                    // promise lets a timed-out wait swallow a later event.
+                    let timer: ReturnType<typeof setTimeout> | undefined;
+                    const timedOut = await Promise.race([
+                      waitForNext().then(() => false),
+                      new Promise<boolean>((r) => {
+                        timer = setTimeout(() => r(true), timeoutMs);
+                      }),
                     ]);
-                    if (result === STREAM_END) break;
-                    if (result === null && queue.length === 0) {
+                    clearTimeout(timer);
+                    if (timedOut && queue.length === 0) {
                       safeEnqueue(encoder.encode(": ping\n\n"));
                       lastEventTime = Date.now();
                       continue;
                     }
-                    evt = result ?? queue.shift() ?? null;
+                    evt = queue.shift() ?? null;
+                    if (evt === null) continue;
                   } else {
                     await waitForNext();
                     evt = queue.shift() ?? null;
@@ -1469,16 +1481,19 @@ async function handleChatCompletions(
                 }
 
                 if (delta) {
-                  sentContent = true;
                   assembledText += delta;
-                  const chunk = {
-                    id: respId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: requestedModelForResponse,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-                  };
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  const toEmit = toolCallFilter ? toolCallFilter.feed(delta) : delta;
+                  if (toEmit) {
+                    sentContent = true;
+                    const chunk = {
+                      id: respId,
+                      object: "chat.completion.chunk",
+                      created,
+                      model: requestedModelForResponse,
+                      choices: [{ index: 0, delta: { content: toEmit }, finish_reason: null }],
+                    };
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  }
                 }
               }
 
@@ -1486,11 +1501,43 @@ async function handleChatCompletions(
               break;
             }
 
-            // cursor-agent tool call: check accumulated text for tool call markers at stream end
+            // Flush any non-marker tail held for partial-marker lookahead.
+            if (toolCallFilter) {
+              const flushed = toolCallFilter.flush();
+              if (flushed) {
+                sentContent = true;
+                const chunk = {
+                  id: respId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: requestedModelForResponse,
+                  choices: [{ index: 0, delta: { content: flushed }, finish_reason: null }],
+                };
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              }
+            }
+
+            // cursor-agent tool call: strip markers from content, emit structured tool_calls
             if (provider === "cursor-agent" && requestTools && requestTools.length > 0 && assembledText) {
               const parsed = parseToolCallResponse(assembledText);
               if (parsed.toolCalls && parsed.toolCalls.length > 0) {
                 streamToolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
+                // Emit any clean text that lived after/around markers and was never streamed.
+                const remainder = toolCallContentRemainder(
+                  toolCallFilter?.streamedContent ?? "",
+                  parsed.text
+                );
+                if (remainder) {
+                  sentContent = true;
+                  const chunk = {
+                    id: respId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: requestedModelForResponse,
+                    choices: [{ index: 0, delta: { content: remainder }, finish_reason: null }],
+                  };
+                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                }
               }
             }
 

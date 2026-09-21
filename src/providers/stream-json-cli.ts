@@ -34,7 +34,27 @@ function normalizeMessageContent(content: unknown): string {
  */
 export class TextAssembler {
   text = '';
+  /**
+   * Text of the in-flight assistant message only (between tool boundaries).
+   * Used to detect cursor-agent's full-message replay that still carries
+   * `timestamp_ms` after incremental deltas.
+   */
+  currentMessage = '';
+  /** Number of feedDelta calls for the in-flight message. */
+  currentDeltaCount = 0;
 
+  /** Start a new assistant message (e.g. after a tool_call). */
+  resetCurrentMessage(): void {
+    this.currentMessage = '';
+    this.currentDeltaCount = 0;
+  }
+
+  /**
+   * Feed a chunk of unknown kind (full snapshot or delta) and guess from the text.
+   * Only safe when the caller cannot tell the two apart: a delta that repeats or
+   * extends everything seen so far is misread as a snapshot and loses characters.
+   * Prefer feedDelta() whenever the stream marks its incremental chunks.
+   */
   feed(incoming: string): string {
     const s = incoming ?? '';
     if (!s) return '';
@@ -48,7 +68,49 @@ export class TextAssembler {
     this.text += s;
     return s;
   }
+
+  /** Feed a known-incremental chunk. Always appended, never deduplicated. */
+  feedDelta(chunk: string): string {
+    const s = chunk ?? '';
+    if (!s) return '';
+    this.currentMessage += s;
+    this.currentDeltaCount += 1;
+    this.text += s;
+    return s;
+  }
+
+  /**
+   * Feed a known full-message snapshot (e.g. cursor-agent terminal assistant
+   * event without timestamp_ms). Never falls back to append: a divergent
+   * snapshot after partial deltas would otherwise re-stream the whole answer.
+   */
+  feedSnapshot(incoming: string): string {
+    const s = incoming ?? '';
+    if (!s) return '';
+    if (s === this.text) return '';
+    if (s.startsWith(this.text)) {
+      const delta = s.slice(this.text.length);
+      this.text = s;
+      return delta;
+    }
+    // Snapshot is a prefix of what partials already built — ignore.
+    if (this.text.startsWith(s)) return '';
+    // Multi-turn: terminal snapshot of the latest message only (already streamed).
+    if (this.text.endsWith(s)) return '';
+    // First content is a snapshot (no prior partials).
+    if (!this.text) {
+      this.text = s;
+      return s;
+    }
+    // Divergent terminal after partials: keep partial assembly, do not re-emit.
+    return '';
+  }
 }
+
+/** Stop reading stdout once this many unconsumed lines pile up. */
+const LINE_BUFFER_HIGH_WATER = 1024;
+/** Resume reading stdout once the backlog drains back to this. */
+const LINE_BUFFER_LOW_WATER = 256;
 
 export interface IterStreamJsonEventsOptions {
   cmd: string[];
@@ -173,32 +235,63 @@ export async function* iterStreamJsonEvents(
 
     const iface = rl; // non-null: assigned above, only reached inside try block
 
-    const nextLine = (): Promise<string | null> =>
-      new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          iface.removeListener('line', onLine);
-          iface.removeListener('close', onClose);
+    // readline emits every line of a stdout chunk synchronously, so a listener
+    // attached per await only ever sees the first one and the rest are dropped.
+    // Keep one permanent listener and queue the lines instead.
+    const pending: string[] = [];
+    let inputClosed = false;
+    let paused = false;
+    let notify: (() => void) | null = null;
+
+    const wake = () => {
+      const fn = notify;
+      notify = null;
+      fn?.();
+    };
+
+    iface.on('line', (line: string) => {
+      pending.push(line);
+      if (!paused && pending.length >= LINE_BUFFER_HIGH_WATER) {
+        paused = true;
+        iface.pause();
+      }
+      wake();
+    });
+    iface.on('close', () => {
+      inputClosed = true;
+      wake();
+    });
+
+    const nextLine = async (): Promise<string | null> => {
+      for (;;) {
+        const line = pending.shift();
+        if (line !== undefined) {
+          if (paused && pending.length <= LINE_BUFFER_LOW_WATER) {
+            paused = false;
+            iface.resume();
+          }
+          return line;
+        }
+        if (inputClosed) return null;
+
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timedOut = await new Promise<boolean>((resolve) => {
+          notify = () => {
+            clearTimeout(timer);
+            resolve(false);
+          };
+          timer = setTimeout(() => {
+            notify = null;
+            resolve(true);
+          }, timeoutMs);
+        });
+
+        if (timedOut) {
           proc.kill("SIGKILL");
-          reject(new Error(`subprocess timeout after ${timeoutMs}ms`));
-        }, timeoutMs);
-
-        const onLine = (line: string) => {
-          clearTimeout(timer);
-          iface.removeListener('line', onLine);
-          iface.removeListener('close', onClose);
-          resolve(line);
-        };
-
-        const onClose = () => {
-          clearTimeout(timer);
-          iface.removeListener('line', onLine);
-          iface.removeListener('close', onClose);
-          resolve(null);
-        };
-
-        iface.once('line', onLine);
-        iface.once('close', onClose);
-      });
+          throw new Error(`subprocess timeout after ${timeoutMs}ms`);
+        }
+      }
+    };
 
     while (true) {
       if (totalTimedOut) {
@@ -278,12 +371,49 @@ export function extractCursorAgentDelta(
   evt: Record<string, unknown>,
   assembler: TextAssembler
 ): string {
+  // Tool boundaries end the current assistant message; subsequent text is new.
+  const evtType = typeof evt.type === 'string' ? evt.type : '';
+  if (
+    evtType === 'tool_call' ||
+    evtType === 'tool_result' ||
+    evtType.startsWith('tool_call') ||
+    evtType.startsWith('tool_result')
+  ) {
+    assembler.resetCurrentMessage();
+    return '';
+  }
   if (evt.type !== 'assistant') return '';
   const message = evt.message;
   if (!message || typeof message !== 'object') return '';
-  const content = (message as Record<string, unknown>).content;
-  const incoming = normalizeMessageContent(content);
-  return assembler.feed(incoming);
+  const content = normalizeMessageContent((message as Record<string, unknown>).content);
+  // Under --stream-partial-output each incremental chunk carries timestamp_ms while
+  // the terminal full-message event omits it. Without that signal, chunks that
+  // repeat or extend the assembled text are mistaken for a snapshot and dropped.
+  // Terminal events must use feedSnapshot (never append-fallback), or a slightly
+  // different full message re-streams the entire answer as a second copy.
+  //
+  // Additionally, cursor-agent often re-emits the full current message as one more
+  // timestamp_ms event after the incremental deltas (still with timestamp_ms).
+  // Treating that as feedDelta doubles every narration segment in the SSE stream.
+  // Do NOT treat "content.startsWith(currentMessage)" as cumulative: Chinese
+  // token deltas like "我" then "我们都在" must still append in full.
+  if (typeof evt.timestamp_ms === 'number') {
+    const cur = assembler.currentMessage;
+    // Full-message replay after 2+ deltas (allow trailing whitespace drift).
+    if (
+      content &&
+      cur &&
+      assembler.currentDeltaCount >= 2 &&
+      (content === cur || content.trimEnd() === cur.trimEnd())
+    ) {
+      assembler.resetCurrentMessage();
+      return '';
+    }
+    return assembler.feedDelta(content);
+  }
+  const delta = assembler.feedSnapshot(content);
+  assembler.resetCurrentMessage();
+  return delta;
 }
 
 /**

@@ -387,7 +387,96 @@ interface ToolDef {
   function: ToolFunction;
 }
 
-const TOOL_CALL_MARKER = "___TOOL_CALL___";
+export const TOOL_CALL_MARKER = "___TOOL_CALL___";
+
+/**
+ * Longest suffix of `s` that is a proper prefix of `marker` (length < marker.length).
+ * Used so a marker split across chunks is not prematurely emitted as content.
+ */
+function longestMarkerPrefixSuffix(s: string, marker: string): number {
+  const max = Math.min(s.length, marker.length - 1);
+  for (let n = max; n > 0; n--) {
+    if (marker.startsWith(s.slice(-n))) return n;
+  }
+  return 0;
+}
+
+/**
+ * Streaming filter that holds back `___TOOL_CALL___` blocks so they are not
+ * emitted as plain content. Text before the first marker streams normally;
+ * from the first marker onward everything is buffered until parseToolCallResponse.
+ */
+export class ToolCallMarkerStreamFilter {
+  private pending = "";
+  private holding = false;
+  private held = "";
+  private streamed = "";
+
+  /** Feed an incremental chunk. Returns content safe to stream (may be empty). */
+  feed(chunk: string): string {
+    const s = chunk ?? "";
+    if (!s) return "";
+    if (this.holding) {
+      this.held += s;
+      return "";
+    }
+    this.pending += s;
+    const idx = this.pending.indexOf(TOOL_CALL_MARKER);
+    if (idx >= 0) {
+      const clean = this.pending.slice(0, idx);
+      this.held = this.pending.slice(idx);
+      this.pending = "";
+      this.holding = true;
+      this.streamed += clean;
+      return clean;
+    }
+    const holdBack = longestMarkerPrefixSuffix(this.pending, TOOL_CALL_MARKER);
+    const safe = this.pending.slice(0, this.pending.length - holdBack);
+    this.pending = this.pending.slice(this.pending.length - holdBack);
+    this.streamed += safe;
+    return safe;
+  }
+
+  /**
+   * Flush any held-back non-marker tail at end of stream.
+   * Returns "" if a marker was seen (held text stays for parseToolCallResponse).
+   */
+  flush(): string {
+    if (this.holding) return "";
+    const rest = this.pending;
+    this.pending = "";
+    this.streamed += rest;
+    return rest;
+  }
+
+  /** Content already returned from feed/flush (excludes held marker blocks). */
+  get streamedContent(): string {
+    return this.streamed;
+  }
+
+  /** Whether a full marker has been seen and subsequent text is held. */
+  get isHolding(): boolean {
+    return this.holding;
+  }
+}
+
+/**
+ * After stripping tool-call markers, compute any clean text not yet streamed.
+ * Avoids re-emitting the pre-marker prefix that was already sent as deltas.
+ */
+export function toolCallContentRemainder(streamed: string, cleanText: string): string {
+  const clean = cleanText ?? "";
+  if (!clean) return "";
+  if (!streamed) return clean;
+  if (clean.startsWith(streamed)) return clean.slice(streamed.length);
+  const streamedTrimmed = streamed.trimEnd();
+  if (!streamedTrimmed) return clean;
+  if (clean === streamedTrimmed) return "";
+  if (clean.startsWith(streamedTrimmed)) return clean.slice(streamedTrimmed.length);
+  // Already showed at least the clean text (whitespace-only difference) — do not re-emit.
+  if (streamedTrimmed.startsWith(clean) || streamed.includes(clean)) return "";
+  return "";
+}
 
 /**
  * Extract balanced JSON objects between TOOL_CALL_MARKER pairs.
